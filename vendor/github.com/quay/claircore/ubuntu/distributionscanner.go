@@ -1,0 +1,120 @@
+package ubuntu
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"runtime/trace"
+	"strings"
+
+	"github.com/quay/zlog"
+
+	"github.com/quay/claircore"
+	"github.com/quay/claircore/indexer"
+	"github.com/quay/claircore/pkg/tarfs"
+)
+
+const (
+	scannerName    = "ubuntu"
+	scannerVersion = "2"
+	scannerKind    = "distribution"
+
+	osReleasePath  = `etc/os-release`
+	lsbReleasePath = `etc/lsb-release`
+)
+
+var (
+	_ indexer.DistributionScanner = (*DistributionScanner)(nil)
+	_ indexer.VersionedScanner    = (*DistributionScanner)(nil)
+)
+
+// DistributionScanner implements [indexer.DistributionScanner] looking for Ubuntu distributions.
+type DistributionScanner struct{}
+
+// Name implements [scanner.VersionedScanner].
+func (*DistributionScanner) Name() string { return scannerName }
+
+// Version implements [scanner.VersionedScanner].
+func (*DistributionScanner) Version() string { return scannerVersion }
+
+// Kind implements [scanner.VersionedScanner].
+func (*DistributionScanner) Kind() string { return scannerKind }
+
+// Scan implements [indexer.DistributionScanner].
+func (ds *DistributionScanner) Scan(ctx context.Context, l *claircore.Layer) ([]*claircore.Distribution, error) {
+	defer trace.StartRegion(ctx, "Scanner.Scan").End()
+	ctx = zlog.ContextWithValues(ctx,
+		"component", "ubuntu/DistributionScanner.Scan",
+		"version", ds.Version(),
+		"layer", l.Hash.String())
+	zlog.Debug(ctx).Msg("start")
+	defer zlog.Debug(ctx).Msg("done")
+	rd, err := l.Reader()
+	if err != nil {
+		return nil, fmt.Errorf("ubuntu: unable to open layer: %w", err)
+	}
+	defer rd.Close()
+	sys, err := tarfs.New(rd)
+	if err != nil {
+		return nil, fmt.Errorf("ubuntu: unable to open layer: %w", err)
+	}
+	d, err := findDist(sys)
+	if err != nil {
+		return nil, fmt.Errorf("ubuntu: %w", err)
+	}
+	if d == nil {
+		return nil, nil
+	}
+	return []*claircore.Distribution{d}, nil
+}
+
+func findDist(sys fs.FS) (*claircore.Distribution, error) {
+	var err error
+	var b []byte
+	var verKey, nameKey string
+
+	b, err = fs.ReadFile(sys, `etc/lsb-release`)
+	if errors.Is(err, nil) {
+		verKey = `DISTRIB_RELEASE`
+		nameKey = `DISTRIB_CODENAME`
+		goto Found
+	}
+	b, err = fs.ReadFile(sys, `etc/os-release`)
+	if errors.Is(err, nil) {
+		verKey = `VERSION_ID`
+		nameKey = `VERSION_CODENAME`
+		goto Found
+	}
+	return nil, nil
+
+Found:
+	var ver, name string
+	buf := bytes.NewBuffer(b)
+	for l, err := buf.ReadString('\n'); len(l) != 0; l, err = buf.ReadString('\n') {
+		switch {
+		case errors.Is(err, nil):
+		case errors.Is(err, io.EOF):
+		default:
+			return nil, fmt.Errorf("unexpected error looking for %q: %w", verKey, err)
+		}
+		// TODO(hank) Use Cut in 1.18
+		s := strings.SplitN(l, "=", 2)
+		if len(s) != 2 {
+			continue
+		}
+		val := strings.Trim(s[1], "\"\r\n")
+		switch s[0] {
+		case nameKey:
+			name = val
+		case verKey:
+			ver = val
+		}
+	}
+	if name != "" && ver != "" {
+		return mkDist(ver, name), nil
+	}
+	return nil, nil
+}
